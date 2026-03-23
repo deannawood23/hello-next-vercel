@@ -344,14 +344,12 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
                 throw selectError;
             }
 
-            const nowISO = new Date().toISOString();
-
             if (existing?.id) {
                 const { error: updateError } = await supabase
                     .from('caption_votes')
                     .update({
                         vote_value: voteValue,
-                        modified_datetime_utc: nowISO,
+                        modified_by_user_id: user.id,
                     })
                     .eq('id', existing.id);
 
@@ -365,8 +363,8 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
                         profile_id: user.id,
                         caption_id: captionId,
                         vote_value: voteValue,
-                        created_datetime_utc: nowISO,
-                        modified_datetime_utc: nowISO,
+                        created_by_user_id: user.id,
+                        modified_by_user_id: user.id,
                     });
 
                 if (insertError) {
