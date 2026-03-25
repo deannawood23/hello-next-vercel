@@ -135,6 +135,28 @@ async function loadHumorFlavorOptions(): Promise<HumorFlavorOption[]> {
         );
     }
 
+    const { data: captionRows, error: captionsError } = await supabase
+        .from('captions')
+        .select('humor_flavor_id')
+        .in('humor_flavor_id', uniqueIds)
+        .limit(2000);
+
+    if (!captionsError) {
+        const flavorIdsWithCaptions = new Set(
+            (captionRows ?? [])
+                .map((row) => row.humor_flavor_id)
+                .filter(
+                    (value): value is number =>
+                        typeof value === 'number' && Number.isFinite(value)
+                )
+        );
+
+        const filteredIds = uniqueIds.filter((id) => flavorIdsWithCaptions.has(id));
+        if (filteredIds.length > 0) {
+            uniqueIds.splice(0, uniqueIds.length, ...filteredIds);
+        }
+    }
+
     const { data: flavorRows, error: flavorsError } = await supabase
         .from('humor_flavors')
         .select('id, slug, description')
