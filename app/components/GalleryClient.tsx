@@ -2,7 +2,6 @@
 
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
 import { supabase } from '../../src/lib/supabase/client';
 
 type Image = {
@@ -27,12 +26,9 @@ type CaptionSessionItem = {
     };
 };
 
-type GalleryClientProps = {
-    userEmail: string;
-};
-
 const CAPTIONS_PER_SESSION = 10;
 const VIEWED_IMAGES_STORAGE_PREFIX = 'viewed-image-ids';
+const UPLOAD_PROMPT_STORAGE_KEY = 'seen-upload-prompt';
 
 type HumorFlavorOption = {
     id: number;
@@ -122,8 +118,7 @@ async function loadHumorFlavorOptions(): Promise<HumorFlavorOption[]> {
     });
 }
 
-export function GalleryClient({ userEmail }: GalleryClientProps) {
-    const router = useRouter();
+export function GalleryClient() {
     const seenCaptionIdsRef = useRef<Set<string>>(new Set());
     const seenImageIdsRef = useRef<Set<string>>(new Set());
     const viewedImageIdsRef = useRef<Set<string>>(new Set());
@@ -131,7 +126,6 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
     const [captionItems, setCaptionItems] = useState<CaptionSessionItem[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
-    const [signingOut, setSigningOut] = useState(false);
     const [currentIndex, setCurrentIndex] = useState(0);
     const [authChecked, setAuthChecked] = useState(false);
     const [userId, setUserId] = useState<string | null>(null);
@@ -143,6 +137,7 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
     const [selectedHumorFlavorId, setSelectedHumorFlavorId] = useState<number | null>(null);
     const [humorFlavorLoading, setHumorFlavorLoading] = useState(true);
     const [humorFlavorError, setHumorFlavorError] = useState<string | null>(null);
+    const [showUploadPrompt, setShowUploadPrompt] = useState(false);
 
     const currentItem = captionItems[currentIndex] ?? null;
     const nextItem = captionItems[currentIndex + 1] ?? null;
@@ -252,6 +247,26 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
             // Ignore localStorage write failures and keep in-memory history.
         }
     }, [currentItem, selectedHumorFlavorId, userId]);
+
+    useEffect(() => {
+        try {
+            const hasSeenPrompt = window.localStorage.getItem(UPLOAD_PROMPT_STORAGE_KEY);
+            if (!hasSeenPrompt) {
+                setShowUploadPrompt(true);
+            }
+        } catch {
+            setShowUploadPrompt(true);
+        }
+    }, []);
+
+    const dismissUploadPrompt = () => {
+        setShowUploadPrompt(false);
+        try {
+            window.localStorage.setItem(UPLOAD_PROMPT_STORAGE_KEY, 'true');
+        } catch {
+            // Ignore localStorage write failures.
+        }
+    };
 
     useEffect(() => {
         let isMounted = true;
@@ -480,20 +495,6 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
         };
     }, [humorFlavorLoading, selectedHumorFlavorId]);
 
-    const handleSignOut = async () => {
-        setSigningOut(true);
-        const { error: signOutError } = await supabase.auth.signOut();
-
-        if (signOutError) {
-            setError(signOutError.message);
-            setSigningOut(false);
-            return;
-        }
-
-        router.push('/login');
-        router.refresh();
-    };
-
     const goToNextCaption = () => {
         setVoteError(null);
         const nextIndex = currentIndex < captionItems.length ? currentIndex + 1 : currentIndex;
@@ -594,7 +595,7 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
             <div aria-hidden="true" className="ambient-blob ambient-blob-secondary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-tertiary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-bottom" />
-            <div className="fixed right-4 top-4 z-20 flex items-start gap-2">
+            <div className="fixed right-4 top-20 z-20">
                 <div className="linear-glass hidden min-w-[220px] rounded-2xl p-3 lg:block">
                     <label
                         htmlFor="vote-humor-flavor"
@@ -642,50 +643,40 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
                         </svg>
                     </div>
                 </div>
-                <Link
-                    href="/new"
-                    className="inline-flex rounded-lg border border-[#5E6AD2]/50 bg-[#5E6AD2] px-4 py-2 text-sm font-semibold text-white shadow-[0_0_0_1px_rgba(94,106,210,0.5),0_4px_12px_rgba(94,106,210,0.3),inset_0_1px_0_rgba(255,255,255,0.2)] transition duration-200 ease-out hover:bg-[#6872D9]"
-                >
-                    New Post
-                </Link>
-                <details className="group relative">
-                    <summary
-                        className="inline-flex h-10 w-10 list-none items-center justify-center rounded-full border border-white/10 bg-white/[0.04] text-[#EDEDEF] shadow-[0_2px_20px_rgba(0,0,0,0.45)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5E6AD2]/60 focus-visible:ring-offset-2 focus-visible:ring-offset-[#050506]"
-                        aria-label="Account"
-                    >
-                        <svg
-                            aria-hidden="true"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.8"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            className="h-5 w-5"
-                        >
-                            <path d="M20 21a8 8 0 0 0-16 0" />
-                            <circle cx="12" cy="8" r="4" />
-                        </svg>
-                    </summary>
-                    <div className="linear-glass absolute right-0 mt-2 w-64 rounded-2xl p-4">
-                        <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-[#8A8F98]">
-                            Signed in as
-                        </p>
-                        <p className="mt-1 text-sm font-semibold text-[#EDEDEF]">
-                            {userEmail || 'Unknown user'}
-                        </p>
-                        <button
-                            type="button"
-                            onClick={handleSignOut}
-                            className="mt-4 w-full rounded-lg border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-60"
-                            disabled={signingOut}
-                        >
-                            Log out
-                        </button>
-                    </div>
-                </details>
             </div>
             <div className="relative z-10 mx-auto flex w-full max-w-3xl flex-col gap-8">
+                {showUploadPrompt && (
+                    <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/55 px-4">
+                        <div className="linear-glass w-full max-w-md rounded-3xl p-6">
+                            <p className="font-mono text-[11px] uppercase tracking-[0.22em] text-[#8A8F98]">
+                                First Time Here
+                            </p>
+                            <h2 className="mt-3 text-2xl font-semibold text-[#EDEDEF]">
+                                Upload your own image too
+                            </h2>
+                            <p className="mt-3 text-sm leading-6 text-[#B8BDC8]">
+                                You can keep voting, or open New Post to upload an image and
+                                generate captions in your chosen humor flavor.
+                            </p>
+                            <div className="mt-6 flex items-center gap-3">
+                                <Link
+                                    href="/new"
+                                    onClick={dismissUploadPrompt}
+                                    className="inline-flex rounded-lg border border-[#5E6AD2]/50 bg-[#5E6AD2] px-4 py-2 text-sm font-semibold text-white shadow-[0_0_0_1px_rgba(94,106,210,0.5),0_4px_12px_rgba(94,106,210,0.3),inset_0_1px_0_rgba(255,255,255,0.2)] transition duration-200 ease-out hover:bg-[#6872D9]"
+                                >
+                                    Go to New Post
+                                </Link>
+                                <button
+                                    type="button"
+                                    onClick={dismissUploadPrompt}
+                                    className="inline-flex rounded-lg border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08]"
+                                >
+                                    Keep Voting
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
                 <header className="space-y-3 pt-8 sm:pt-12">
                     <p className="font-mono text-[11px] uppercase tracking-[0.24em] text-[#8A8F98]">
                         See what&apos;s cookin
