@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { supabase } from '../../src/lib/supabase/client';
 
 const PIPELINE_BASE_URL = 'https://api.almostcrackd.ai';
@@ -97,6 +97,84 @@ function parseCaptionList(data: unknown): string[] {
     return captions;
 }
 
+function shouldRetryWithDifferentHumorFlavor(message: string): boolean {
+    const normalized = message.toLowerCase();
+    return (
+        normalized.includes('humor flavor steps not found') ||
+        (normalized.includes('humorflavorid') && normalized.includes('not found'))
+    );
+}
+
+type HumorFlavorOption = {
+    id: number;
+    label: string;
+    slug: string | null;
+};
+
+async function loadHumorFlavorOptions(): Promise<HumorFlavorOption[]> {
+    const { data, error } = await supabase
+        .from('humor_flavor_steps')
+        .select('humor_flavor_id, order_by')
+        .order('humor_flavor_id', { ascending: true })
+        .order('order_by', { ascending: true })
+        .limit(200);
+
+    if (error) {
+        throw new Error(`Failed to load humor flavor settings: ${error.message}`);
+    }
+
+    const uniqueIds = Array.from(
+        new Set(
+            (data ?? [])
+                .map((row) => row.humor_flavor_id)
+                .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+        )
+    );
+
+    if (uniqueIds.length === 0) {
+        throw new Error(
+            'No humor flavor steps are configured in Supabase. Add at least one row to public.humor_flavor_steps before generating captions.'
+        );
+    }
+
+    const { data: flavorRows, error: flavorsError } = await supabase
+        .from('humor_flavors')
+        .select('id, slug, description')
+        .in('id', uniqueIds)
+        .order('id', { ascending: true });
+
+    if (flavorsError) {
+        return uniqueIds.map((id) => ({
+            id,
+            label: `Flavor ${id}`,
+            slug: null,
+        }));
+    }
+
+    const flavorsById = new Map(
+        (flavorRows ?? []).map((row) => [
+            row.id,
+            {
+                slug: typeof row.slug === 'string' ? row.slug : null,
+                description:
+                    typeof row.description === 'string' && row.description.trim().length > 0
+                        ? row.description.trim()
+                        : null,
+            },
+        ])
+    );
+
+    return uniqueIds.map((id) => {
+        const flavor = flavorsById.get(id);
+        const slug = flavor?.slug ?? null;
+        return {
+            id,
+            slug,
+            label: slug ?? flavor?.description ?? `Flavor ${id}`,
+        };
+    });
+}
+
 type NewPostClientProps = {
     userEmail: string;
 };
@@ -111,11 +189,71 @@ export function NewPostClient({ userEmail }: NewPostClientProps) {
     const [imageUrl, setImageUrl] = useState<string | null>(null);
     const [captions, setCaptions] = useState<string[]>([]);
     const [captionIndex, setCaptionIndex] = useState(0);
+    const [humorFlavorOptions, setHumorFlavorOptions] = useState<HumorFlavorOption[]>([]);
+    const [selectedHumorFlavorId, setSelectedHumorFlavorId] = useState<number | null>(null);
+    const [humorFlavorError, setHumorFlavorError] = useState<string | null>(null);
+    const [humorFlavorLoading, setHumorFlavorLoading] = useState(true);
 
     const currentCaption = captions[captionIndex] ?? null;
     const isFirstCaption = captionIndex <= 0;
     const isLastCaption = captionIndex >= captions.length - 1;
     const fileLabel = useMemo(() => selectedFile?.name ?? 'No file selected', [selectedFile]);
+
+    useEffect(() => {
+        let isMounted = true;
+
+        const loadOptions = async () => {
+            setHumorFlavorLoading(true);
+            setHumorFlavorError(null);
+
+            try {
+                const options = await loadHumorFlavorOptions();
+                if (!isMounted) {
+                    return;
+                }
+
+                setHumorFlavorOptions(options);
+                const defaultOption =
+                    options.find((option) => option.slug === 'col-um-bia') ?? options[0] ?? null;
+                setSelectedHumorFlavorId(defaultOption?.id ?? null);
+            } catch (error) {
+                if (!isMounted) {
+                    return;
+                }
+
+                setHumorFlavorOptions([]);
+                setSelectedHumorFlavorId(null);
+                setHumorFlavorError(
+                    error instanceof Error ? error.message : 'Failed to load humor flavors.'
+                );
+            } finally {
+                if (isMounted) {
+                    setHumorFlavorLoading(false);
+                }
+            }
+        };
+
+        loadOptions();
+
+        return () => {
+            isMounted = false;
+        };
+    }, []);
+
+    const generateCaptionsForFlavor = async (
+        authHeaders: Record<string, string>,
+        imageId: string,
+        humorFlavorId: number
+    ) => {
+        const response = await fetch(`${PIPELINE_BASE_URL}/pipeline/generate-captions`, {
+            method: 'POST',
+            headers: authHeaders,
+            body: JSON.stringify({ imageId, humorFlavorId }),
+        });
+
+        const data = (await response.json().catch(() => [])) as unknown;
+        return { response, data };
+    };
 
     const onFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
         const file = event.target.files?.[0] ?? null;
@@ -144,6 +282,10 @@ export function NewPostClient({ userEmail }: NewPostClientProps) {
     const generateCaptions = async () => {
         if (!selectedFile) {
             setErrorMessage('Choose an image first.');
+            return;
+        }
+        if (!selectedHumorFlavorId) {
+            setErrorMessage('Choose a humor flavor first.');
             return;
         }
 
@@ -229,22 +371,21 @@ export function NewPostClient({ userEmail }: NewPostClientProps) {
             }
 
             setStatusMessage('Generating captions...');
-            const generateResponse = await fetch(
-                `${PIPELINE_BASE_URL}/pipeline/generate-captions`,
-                {
-                    method: 'POST',
-                    headers: authHeaders,
-                    body: JSON.stringify({ imageId: registerData.imageId }),
-                }
-            );
-            const generatedData = (await generateResponse
-                .json()
-                .catch(() => [])) as unknown;
+            const { response: generateResponse, data: generatedData } =
+                await generateCaptionsForFlavor(
+                    authHeaders,
+                    registerData.imageId,
+                    selectedHumorFlavorId
+                );
 
             if (!generateResponse.ok) {
-                throw new Error(
-                    parseErrorMessage(generatedData, 'Failed to generate captions.')
-                );
+                const message = parseErrorMessage(generatedData, 'Failed to generate captions.');
+                if (shouldRetryWithDifferentHumorFlavor(message)) {
+                    throw new Error(
+                        `Humor flavor ${selectedHumorFlavorId} exists in app configuration, but the pipeline has no steps for it. Verify rows in public.humor_flavor_steps for humor_flavor_id ${selectedHumorFlavorId}.`
+                    );
+                }
+                throw new Error(message);
             }
 
             const nextCaptions = parseCaptionList(generatedData);
@@ -285,7 +426,58 @@ export function NewPostClient({ userEmail }: NewPostClientProps) {
             <div aria-hidden="true" className="ambient-blob ambient-blob-secondary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-tertiary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-bottom" />
-            <div className="fixed right-4 top-4 z-20 flex items-center gap-2">
+            <div className="fixed right-4 top-4 z-20 flex items-start gap-2">
+                <div className="linear-glass hidden min-w-[220px] rounded-2xl p-3 lg:block">
+                    <label
+                        htmlFor="humor-flavor"
+                        className="font-mono text-[10px] uppercase tracking-[0.18em] text-[#8A8F98]"
+                    >
+                        Humor Flavor
+                    </label>
+                    <div className="relative mt-2">
+                        <select
+                            id="humor-flavor"
+                            value={selectedHumorFlavorId ?? ''}
+                            onChange={(event) =>
+                                setSelectedHumorFlavorId(Number(event.target.value) || null)
+                            }
+                            disabled={
+                                uploading ||
+                                humorFlavorLoading ||
+                                humorFlavorOptions.length === 0
+                            }
+                            className="w-full appearance-none rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 pr-10 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition duration-200 ease-out focus:border-[#5E6AD2]/50 focus:outline-none focus:ring-2 focus:ring-[#5E6AD2]/40 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                            {humorFlavorOptions.length === 0 ? (
+                                <option value="">
+                                    {humorFlavorLoading
+                                        ? 'Loading flavors...'
+                                        : 'No flavors available'}
+                                </option>
+                            ) : (
+                                humorFlavorOptions.map((option) => (
+                                    <option
+                                        key={option.id}
+                                        value={option.id}
+                                        className="bg-[#111214] text-[#EDEDEF]"
+                                    >
+                                        {option.label}
+                                    </option>
+                                ))
+                            )}
+                        </select>
+                        <svg
+                            aria-hidden="true"
+                            viewBox="0 0 20 20"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.8"
+                            className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#8A8F98]"
+                        >
+                            <path d="M5 7.5 10 12.5 15 7.5" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                    </div>
+                </div>
                 <Link
                     href="/vote"
                     className="inline-flex rounded-lg border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08]"
@@ -312,10 +504,16 @@ export function NewPostClient({ userEmail }: NewPostClientProps) {
                         </svg>
                     </summary>
                     <div className="linear-glass absolute right-0 mt-2 w-64 rounded-2xl p-4">
+                        <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-[#8A8F98]">
+                            Signed in as
+                        </p>
+                        <p className="mt-1 text-sm font-semibold text-[#EDEDEF]">
+                            {userEmail || 'Unknown user'}
+                        </p>
                         <button
                             type="button"
                             onClick={handleSignOut}
-                            className="w-full rounded-lg border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-60"
+                            className="mt-4 w-full rounded-lg border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-60"
                             disabled={signingOut}
                         >
                             Log out
@@ -335,6 +533,63 @@ export function NewPostClient({ userEmail }: NewPostClientProps) {
                 </header>
 
                 <section className="linear-glass space-y-4 rounded-2xl p-4 sm:p-6">
+                    <div className="space-y-2 lg:hidden">
+                        <label
+                            htmlFor="humor-flavor"
+                            className="font-mono text-[11px] uppercase tracking-[0.2em] text-[#8A8F98]"
+                        >
+                            Humor Flavor
+                        </label>
+                        <div className="relative">
+                            <select
+                                id="humor-flavor"
+                                value={selectedHumorFlavorId ?? ''}
+                                onChange={(event) =>
+                                    setSelectedHumorFlavorId(Number(event.target.value) || null)
+                                }
+                                disabled={
+                                    uploading ||
+                                    humorFlavorLoading ||
+                                    humorFlavorOptions.length === 0
+                                }
+                                className="w-full appearance-none rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 pr-10 text-base font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition duration-200 ease-out focus:border-[#5E6AD2]/50 focus:outline-none focus:ring-2 focus:ring-[#5E6AD2]/40 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                                {humorFlavorOptions.length === 0 ? (
+                                    <option value="">
+                                        {humorFlavorLoading
+                                            ? 'Loading flavors...'
+                                            : 'No flavors available'}
+                                    </option>
+                                ) : (
+                                    humorFlavorOptions.map((option) => (
+                                        <option
+                                            key={option.id}
+                                            value={option.id}
+                                            className="bg-[#111214] text-[#EDEDEF]"
+                                        >
+                                            {option.label}
+                                        </option>
+                                    ))
+                                )}
+                            </select>
+                            <svg
+                                aria-hidden="true"
+                                viewBox="0 0 20 20"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.8"
+                                className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#8A8F98]"
+                            >
+                                <path d="M5 7.5 10 12.5 15 7.5" strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                        </div>
+                        {humorFlavorError && (
+                            <p className="rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+                                {humorFlavorError}
+                            </p>
+                        )}
+                    </div>
+
                     <input
                         type="file"
                         accept={FILE_INPUT_ACCEPT}
@@ -347,7 +602,12 @@ export function NewPostClient({ userEmail }: NewPostClientProps) {
                     <button
                         type="button"
                         onClick={generateCaptions}
-                        disabled={!selectedFile || uploading}
+                        disabled={
+                            !selectedFile ||
+                            uploading ||
+                            humorFlavorLoading ||
+                            !selectedHumorFlavorId
+                        }
                         className="rounded-lg border border-[#5E6AD2]/50 bg-[#5E6AD2] px-4 py-2 text-sm font-semibold text-white shadow-[0_0_0_1px_rgba(94,106,210,0.5),0_4px_12px_rgba(94,106,210,0.3),inset_0_1px_0_rgba(255,255,255,0.2)] transition duration-200 ease-out hover:bg-[#6872D9] disabled:cursor-not-allowed disabled:opacity-60"
                     >
                         {uploading ? 'Processing...' : 'Generate Captions'}

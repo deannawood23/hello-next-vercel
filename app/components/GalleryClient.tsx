@@ -13,6 +13,7 @@ type Image = {
         id: string;
         content: string | null;
         created_datetime_utc: string;
+        humor_flavor_id?: number | null;
     }[];
 };
 
@@ -31,6 +32,13 @@ type GalleryClientProps = {
 };
 
 const CAPTIONS_PER_SESSION = 10;
+const VIEWED_IMAGES_STORAGE_PREFIX = 'viewed-image-ids';
+
+type HumorFlavorOption = {
+    id: number;
+    label: string;
+    slug: string | null;
+};
 
 function shuffleItems<T>(items: T[]): T[] {
     const shuffled = [...items];
@@ -49,9 +57,76 @@ function hasDisplayableCaption(
     return Boolean(imageUrl && captionContent);
 }
 
+async function loadHumorFlavorOptions(): Promise<HumorFlavorOption[]> {
+    const { data, error } = await supabase
+        .from('humor_flavor_steps')
+        .select('humor_flavor_id, order_by')
+        .order('humor_flavor_id', { ascending: true })
+        .order('order_by', { ascending: true })
+        .limit(200);
+
+    if (error) {
+        throw new Error(`Failed to load humor flavor settings: ${error.message}`);
+    }
+
+    const uniqueIds = Array.from(
+        new Set(
+            (data ?? [])
+                .map((row) => row.humor_flavor_id)
+                .filter(
+                    (value): value is number =>
+                        typeof value === 'number' && Number.isFinite(value)
+                )
+        )
+    );
+
+    if (uniqueIds.length === 0) {
+        throw new Error('No humor flavors are configured yet.');
+    }
+
+    const { data: flavorRows, error: flavorsError } = await supabase
+        .from('humor_flavors')
+        .select('id, slug, description')
+        .in('id', uniqueIds)
+        .order('id', { ascending: true });
+
+    if (flavorsError) {
+        return uniqueIds.map((id) => ({
+            id,
+            label: `Flavor ${id}`,
+            slug: null,
+        }));
+    }
+
+    const flavorsById = new Map(
+        (flavorRows ?? []).map((row) => [
+            row.id,
+            {
+                slug: typeof row.slug === 'string' ? row.slug : null,
+                description:
+                    typeof row.description === 'string' && row.description.trim().length > 0
+                        ? row.description.trim()
+                        : null,
+            },
+        ])
+    );
+
+    return uniqueIds.map((id) => {
+        const flavor = flavorsById.get(id);
+        const slug = flavor?.slug ?? null;
+        return {
+            id,
+            slug,
+            label: slug ?? flavor?.description ?? `Flavor ${id}`,
+        };
+    });
+}
+
 export function GalleryClient({ userEmail }: GalleryClientProps) {
     const router = useRouter();
     const seenCaptionIdsRef = useRef<Set<string>>(new Set());
+    const seenImageIdsRef = useRef<Set<string>>(new Set());
+    const viewedImageIdsRef = useRef<Set<string>>(new Set());
     const fetchMoreCaptionsRef = useRef<(() => Promise<void>) | null>(null);
     const [captionItems, setCaptionItems] = useState<CaptionSessionItem[]>([]);
     const [loading, setLoading] = useState(true);
@@ -64,6 +139,10 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
     const [voteError, setVoteError] = useState<string | null>(null);
     const [votesByCaption, setVotesByCaption] = useState<Record<string, number>>({});
     const [spotlight, setSpotlight] = useState({ x: 50, y: 50, active: false });
+    const [humorFlavorOptions, setHumorFlavorOptions] = useState<HumorFlavorOption[]>([]);
+    const [selectedHumorFlavorId, setSelectedHumorFlavorId] = useState<number | null>(null);
+    const [humorFlavorLoading, setHumorFlavorLoading] = useState(true);
+    const [humorFlavorError, setHumorFlavorError] = useState<string | null>(null);
 
     const currentItem = captionItems[currentIndex] ?? null;
     const nextItem = captionItems[currentIndex + 1] ?? null;
@@ -85,7 +164,106 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
 
     useEffect(() => {
         let isMounted = true;
+
+        const loadOptions = async () => {
+            setHumorFlavorLoading(true);
+            setHumorFlavorError(null);
+
+            try {
+                const options = await loadHumorFlavorOptions();
+                if (!isMounted) {
+                    return;
+                }
+
+                setHumorFlavorOptions(options);
+                const defaultOption =
+                    options.find((option) => option.slug === 'col-um-bia') ?? options[0] ?? null;
+                setSelectedHumorFlavorId(defaultOption?.id ?? null);
+            } catch (error) {
+                if (!isMounted) {
+                    return;
+                }
+
+                setHumorFlavorOptions([]);
+                setSelectedHumorFlavorId(null);
+                setHumorFlavorError(
+                    error instanceof Error ? error.message : 'Failed to load humor flavors.'
+                );
+            } finally {
+                if (isMounted) {
+                    setHumorFlavorLoading(false);
+                }
+            }
+        };
+
+        loadOptions();
+
+        return () => {
+            isMounted = false;
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!userId || !selectedHumorFlavorId) {
+            viewedImageIdsRef.current = new Set();
+            return;
+        }
+
+        const storageKey = `${VIEWED_IMAGES_STORAGE_PREFIX}:${userId}:${selectedHumorFlavorId}`;
+        try {
+            const saved = window.localStorage.getItem(storageKey);
+            if (!saved) {
+                viewedImageIdsRef.current = new Set();
+                return;
+            }
+
+            const parsed = JSON.parse(saved) as unknown;
+            if (!Array.isArray(parsed)) {
+                viewedImageIdsRef.current = new Set();
+                return;
+            }
+
+            viewedImageIdsRef.current = new Set(
+                parsed.filter((value): value is string => typeof value === 'string')
+            );
+        } catch {
+            viewedImageIdsRef.current = new Set();
+        }
+    }, [selectedHumorFlavorId, userId]);
+
+    useEffect(() => {
+        if (!userId || !selectedHumorFlavorId || !currentItem?.imageId) {
+            return;
+        }
+
+        if (viewedImageIdsRef.current.has(currentItem.imageId)) {
+            return;
+        }
+
+        viewedImageIdsRef.current.add(currentItem.imageId);
+        const storageKey = `${VIEWED_IMAGES_STORAGE_PREFIX}:${userId}:${selectedHumorFlavorId}`;
+
+        try {
+            window.localStorage.setItem(
+                storageKey,
+                JSON.stringify(Array.from(viewedImageIdsRef.current))
+            );
+        } catch {
+            // Ignore localStorage write failures and keep in-memory history.
+        }
+    }, [currentItem, selectedHumorFlavorId, userId]);
+
+    useEffect(() => {
+        let isMounted = true;
         let activeUserId: string | null = null;
+
+        if (!selectedHumorFlavorId) {
+            setCaptionItems([]);
+            setLoading(humorFlavorLoading);
+            return () => {
+                isMounted = false;
+            };
+        }
 
         const fetchVotesForCaptionIds = async (
             profileId: string,
@@ -143,7 +321,7 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
             const { data, error: queryError } = await supabase
                 .from('images')
                 .select(
-                    'id, url, created_datetime_utc, captions ( id, content, created_datetime_utc )'
+                    'id, url, created_datetime_utc, captions ( id, content, created_datetime_utc, humor_flavor_id )'
                 )
                 .order('created_datetime_utc', { ascending: false });
 
@@ -163,7 +341,12 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
             const normalized = rows.map((image) => ({
                 ...image,
                 captions: Array.isArray(image.captions)
-                    ? [...image.captions].sort(
+                    ? [...image.captions]
+                          .filter(
+                              (caption) =>
+                                  caption.humor_flavor_id === selectedHumorFlavorId
+                          )
+                          .sort(
                           (a, b) =>
                               Date.parse(b.created_datetime_utc) -
                               Date.parse(a.created_datetime_utc)
@@ -184,32 +367,39 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
                 return bLatest - aLatest;
             });
 
-            const sessionCaptions = shuffleItems(
-                sortedImages
-                    .flatMap((image) =>
-                        image.captions.map((caption) => ({
-                            imageId: image.id,
-                            imageUrl: image.url,
-                            caption,
-                        }))
-                    )
-                    .filter(hasDisplayableCaption)
-                    .filter((item) => {
-                        const captionCreatedMs = Date.parse(
-                            item.caption.created_datetime_utc
-                        );
-                        return (
-                            Number.isFinite(captionCreatedMs) &&
-                            captionCreatedMs >= oneWeekAgoMs
-                        );
-                    })
+            const latestCaptionPerImage = sortedImages
+                .map((image) => ({
+                    imageId: image.id,
+                    imageUrl: image.url,
+                    caption: image.captions[0],
+                }))
+                .filter(hasDisplayableCaption)
+                .filter((item) => {
+                    const captionCreatedMs = Date.parse(item.caption.created_datetime_utc);
+                    return (
+                        Number.isFinite(captionCreatedMs) &&
+                        captionCreatedMs >= oneWeekAgoMs
+                    );
+                });
+
+            const unseenImages = shuffleItems(
+                latestCaptionPerImage.filter(
+                    (item) => !viewedImageIdsRef.current.has(item.imageId)
+                )
             );
+            const seenImages = shuffleItems(
+                latestCaptionPerImage.filter((item) =>
+                    viewedImageIdsRef.current.has(item.imageId)
+                )
+            );
+            const sessionCaptions = [...unseenImages, ...seenImages];
 
             if (reset) {
                 const initialBatch = sessionCaptions.slice(0, CAPTIONS_PER_SESSION);
                 seenCaptionIdsRef.current = new Set(
                     initialBatch.map((item) => item.caption.id)
                 );
+                seenImageIdsRef.current = new Set(initialBatch.map((item) => item.imageId));
                 setCaptionItems(initialBatch);
                 setCurrentIndex(0);
                 if (profileId) {
@@ -226,13 +416,16 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
             }
 
             const unseenCaptions = sessionCaptions.filter(
-                (item) => !seenCaptionIdsRef.current.has(item.caption.id)
+                (item) =>
+                    !seenCaptionIdsRef.current.has(item.caption.id) &&
+                    !seenImageIdsRef.current.has(item.imageId)
             );
             const nextBatch = unseenCaptions.slice(0, CAPTIONS_PER_SESSION);
 
             if (nextBatch.length > 0) {
                 for (const item of nextBatch) {
                     seenCaptionIdsRef.current.add(item.caption.id);
+                    seenImageIdsRef.current.add(item.imageId);
                 }
                 setCaptionItems((prev) => [...prev, ...nextBatch]);
                 if (profileId) {
@@ -285,7 +478,7 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
             window.clearInterval(pollId);
             supabase.removeChannel(channel);
         };
-    }, []);
+    }, [humorFlavorLoading, selectedHumorFlavorId]);
 
     const handleSignOut = async () => {
         setSigningOut(true);
@@ -401,7 +594,54 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
             <div aria-hidden="true" className="ambient-blob ambient-blob-secondary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-tertiary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-bottom" />
-            <div className="fixed right-4 top-4 z-20 flex items-center gap-2">
+            <div className="fixed right-4 top-4 z-20 flex items-start gap-2">
+                <div className="linear-glass hidden min-w-[220px] rounded-2xl p-3 lg:block">
+                    <label
+                        htmlFor="vote-humor-flavor"
+                        className="font-mono text-[10px] uppercase tracking-[0.18em] text-[#8A8F98]"
+                    >
+                        Humor Flavor
+                    </label>
+                    <div className="relative mt-2">
+                        <select
+                            id="vote-humor-flavor"
+                            value={selectedHumorFlavorId ?? ''}
+                            onChange={(event) =>
+                                setSelectedHumorFlavorId(Number(event.target.value) || null)
+                            }
+                            disabled={humorFlavorLoading || humorFlavorOptions.length === 0}
+                            className="w-full appearance-none rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 pr-10 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition duration-200 ease-out focus:border-[#5E6AD2]/50 focus:outline-none focus:ring-2 focus:ring-[#5E6AD2]/40 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                            {humorFlavorOptions.length === 0 ? (
+                                <option value="">
+                                    {humorFlavorLoading
+                                        ? 'Loading flavors...'
+                                        : 'No flavors available'}
+                                </option>
+                            ) : (
+                                humorFlavorOptions.map((option) => (
+                                    <option
+                                        key={option.id}
+                                        value={option.id}
+                                        className="bg-[#111214] text-[#EDEDEF]"
+                                    >
+                                        {option.label}
+                                    </option>
+                                ))
+                            )}
+                        </select>
+                        <svg
+                            aria-hidden="true"
+                            viewBox="0 0 20 20"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.8"
+                            className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#8A8F98]"
+                        >
+                            <path d="M5 7.5 10 12.5 15 7.5" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                    </div>
+                </div>
                 <Link
                     href="/new"
                     className="inline-flex rounded-lg border border-[#5E6AD2]/50 bg-[#5E6AD2] px-4 py-2 text-sm font-semibold text-white shadow-[0_0_0_1px_rgba(94,106,210,0.5),0_4px_12px_rgba(94,106,210,0.3),inset_0_1px_0_rgba(255,255,255,0.2)] transition duration-200 ease-out hover:bg-[#6872D9]"
@@ -454,6 +694,59 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
                         Newest Crackd Captions 👩‍🍳
                     </h1>
                 </header>
+
+                <section className="linear-glass space-y-3 rounded-2xl p-4 sm:p-6 lg:hidden">
+                    <label
+                        htmlFor="vote-humor-flavor"
+                        className="font-mono text-[11px] uppercase tracking-[0.2em] text-[#8A8F98]"
+                    >
+                        Humor Flavor
+                    </label>
+                    <div className="relative">
+                        <select
+                            id="vote-humor-flavor"
+                            value={selectedHumorFlavorId ?? ''}
+                            onChange={(event) =>
+                                setSelectedHumorFlavorId(Number(event.target.value) || null)
+                            }
+                            disabled={humorFlavorLoading || humorFlavorOptions.length === 0}
+                            className="w-full appearance-none rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 pr-10 text-base font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition duration-200 ease-out focus:border-[#5E6AD2]/50 focus:outline-none focus:ring-2 focus:ring-[#5E6AD2]/40 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                            {humorFlavorOptions.length === 0 ? (
+                                <option value="">
+                                    {humorFlavorLoading
+                                        ? 'Loading flavors...'
+                                        : 'No flavors available'}
+                                </option>
+                            ) : (
+                                humorFlavorOptions.map((option) => (
+                                    <option
+                                        key={option.id}
+                                        value={option.id}
+                                        className="bg-[#111214] text-[#EDEDEF]"
+                                    >
+                                        {option.label}
+                                    </option>
+                                ))
+                            )}
+                        </select>
+                        <svg
+                            aria-hidden="true"
+                            viewBox="0 0 20 20"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.8"
+                            className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#8A8F98]"
+                        >
+                            <path d="M5 7.5 10 12.5 15 7.5" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                    </div>
+                    {humorFlavorError && (
+                        <p className="rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+                            {humorFlavorError}
+                        </p>
+                    )}
+                </section>
 
                 {loading && <p className="text-[#8A8F98]">Loading...</p>}
                 {error && !loading && (
@@ -549,7 +842,7 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
                                             type="button"
                                             onClick={() => voteOnCaption(currentItem.caption.id, 1)}
                                             aria-label="Upvote"
-                                            className={`inline-flex h-24 w-72 max-w-[45%] items-center justify-center rounded-xl border px-4 text-5xl leading-none transition duration-200 ease-out disabled:cursor-not-allowed disabled:opacity-60 ${
+                                            className={`inline-flex h-24 w-72 max-w-[45%] flex-col items-center justify-center gap-2 rounded-xl border px-4 text-5xl leading-none transition duration-200 ease-out disabled:cursor-not-allowed disabled:opacity-60 ${
                                                 selectedVote === 1
                                                     ? 'border border-[#5E6AD2]/50 bg-[#5E6AD2] text-white shadow-[0_0_0_1px_rgba(94,106,210,0.5),0_4px_12px_rgba(94,106,210,0.3),inset_0_1px_0_rgba(255,255,255,0.2)]'
                                                     : 'border border-white/10 bg-white/[0.04] text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] hover:border-white/20 hover:bg-white/[0.08]'
@@ -570,12 +863,15 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
                                                 <path d="M11 20h7.2a2 2 0 0 0 2-1.6l1-5a2 2 0 0 0-2-2.4h-4.1l.7-3.2a2 2 0 0 0-2-2.4H12l-3 4.6V20" />
                                                 <path d="M3 10h4v10H3z" />
                                             </svg>
+                                            <span className="text-sm font-semibold tracking-wide">
+                                                Funny
+                                            </span>
                                         </button>
                                         <button
                                             type="button"
                                             onClick={() => voteOnCaption(currentItem.caption.id, -1)}
                                             aria-label="Downvote"
-                                            className={`inline-flex h-24 w-72 max-w-[45%] items-center justify-center rounded-xl border px-4 text-5xl leading-none transition duration-200 ease-out disabled:cursor-not-allowed disabled:opacity-60 ${
+                                            className={`inline-flex h-24 w-72 max-w-[45%] flex-col items-center justify-center gap-2 rounded-xl border px-4 text-5xl leading-none transition duration-200 ease-out disabled:cursor-not-allowed disabled:opacity-60 ${
                                                 selectedVote === -1
                                                     ? 'border border-white/20 bg-white/[0.14] text-white shadow-[0_0_0_1px_rgba(255,255,255,0.12),0_4px_14px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.2)]'
                                                     : 'border border-white/10 bg-white/[0.04] text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] hover:border-white/20 hover:bg-white/[0.08]'
@@ -596,6 +892,9 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
                                                 <path d="M13 4H5.8a2 2 0 0 0-2 1.6l-1 5A2 2 0 0 0 4.8 13h4.1l-.7 3.2a2 2 0 0 0 2 2.4H12l3-4.6V4" />
                                                 <path d="M21 4h-4v10h4z" />
                                             </svg>
+                                            <span className="text-sm font-semibold tracking-wide">
+                                                Not funny
+                                            </span>
                                         </button>
                                     </div>
                                     <div className="absolute bottom-4 left-4 right-4 flex w-auto items-center sm:bottom-6 sm:left-6 sm:right-6">
@@ -605,7 +904,7 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
                                             className="mr-auto rounded-lg border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-60"
                                             disabled={currentIndex === 0 || voteSaving}
                                         >
-                                            Back
+                                            Previous
                                         </button>
                                         <button
                                             type="button"
@@ -613,7 +912,7 @@ export function GalleryClient({ userEmail }: GalleryClientProps) {
                                             className="ml-auto rounded-lg border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-60"
                                             disabled={isLastCaption || voteSaving}
                                         >
-                                            Next
+                                            Skip
                                         </button>
                                     </div>
                                 </div>

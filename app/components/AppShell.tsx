@@ -69,6 +69,7 @@ export function AppShell() {
                         const isActive =
                             pathname === item.href ||
                             pathname.startsWith(`${item.href}/`) ||
+                            (item.href === '/vote' && pathname === '/') ||
                             (item.href === '/new' &&
                                 (pathname === '/new-post' ||
                                     pathname.startsWith('/new-post/')));
@@ -78,7 +79,7 @@ export function AppShell() {
                                 href={item.href}
                                 className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
                                     isActive
-                                        ? 'bg-[#5E6AD2] text-white'
+                                        ? 'border border-[#5E6AD2]/50 bg-[#5E6AD2] text-white shadow-[0_0_0_1px_rgba(94,106,210,0.5),0_4px_12px_rgba(94,106,210,0.3),inset_0_1px_0_rgba(255,255,255,0.2)]'
                                         : 'text-[#EDEDEF] hover:bg-white/[0.08]'
                                 } ${isActive ? 'active' : ''}`}
                                 data-active={isActive ? 'true' : 'false'}
