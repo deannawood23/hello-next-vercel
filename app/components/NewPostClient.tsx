@@ -428,7 +428,7 @@ export function NewPostClient() {
             <div aria-hidden="true" className="ambient-blob ambient-blob-secondary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-tertiary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-bottom" />
-            <div className="fixed right-4 top-20 z-20">
+            <div className="fixed right-8 top-20 z-20">
                 <div className="linear-glass hidden min-w-[220px] rounded-2xl p-3 lg:block">
                     <label
                         htmlFor="humor-flavor"

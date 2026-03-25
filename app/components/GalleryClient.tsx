@@ -29,6 +29,8 @@ type CaptionSessionItem = {
 const CAPTIONS_PER_SESSION = 10;
 const VIEWED_IMAGES_STORAGE_PREFIX = 'viewed-image-ids';
 const UPLOAD_PROMPT_STORAGE_KEY = 'seen-upload-prompt';
+const UPLOAD_PROMPT_VOTE_COUNT_KEY = 'upload-prompt-vote-count';
+const UPLOAD_PROMPT_THRESHOLD = 3;
 
 type HumorFlavorOption = {
     id: number;
@@ -269,17 +271,6 @@ export function GalleryClient() {
             // Ignore localStorage write failures and keep in-memory history.
         }
     }, [currentItem, selectedHumorFlavorId, userId]);
-
-    useEffect(() => {
-        try {
-            const hasSeenPrompt = window.localStorage.getItem(UPLOAD_PROMPT_STORAGE_KEY);
-            if (!hasSeenPrompt) {
-                setShowUploadPrompt(true);
-            }
-        } catch {
-            setShowUploadPrompt(true);
-        }
-    }, []);
 
     const dismissUploadPrompt = () => {
         setShowUploadPrompt(false);
@@ -593,6 +584,25 @@ export function GalleryClient() {
                 [captionId]: voteValue,
             }));
 
+            try {
+                const hasSeenPrompt = window.localStorage.getItem(UPLOAD_PROMPT_STORAGE_KEY);
+                if (!hasSeenPrompt) {
+                    const currentCount = Number(
+                        window.localStorage.getItem(UPLOAD_PROMPT_VOTE_COUNT_KEY) ?? '0'
+                    );
+                    const nextCount = currentCount + 1;
+                    window.localStorage.setItem(
+                        UPLOAD_PROMPT_VOTE_COUNT_KEY,
+                        String(nextCount)
+                    );
+                    if (nextCount >= UPLOAD_PROMPT_THRESHOLD) {
+                        setShowUploadPrompt(true);
+                    }
+                }
+            } catch {
+                // Ignore localStorage failures and skip the prompt counter.
+            }
+
             goToNextCaption();
         } catch (err) {
             const message =
@@ -617,7 +627,7 @@ export function GalleryClient() {
             <div aria-hidden="true" className="ambient-blob ambient-blob-secondary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-tertiary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-bottom" />
-            <div className="fixed right-4 top-20 z-20">
+            <div className="fixed right-8 top-20 z-20">
                 <div className="linear-glass hidden min-w-[220px] rounded-2xl p-3 lg:block">
                     <label
                         htmlFor="vote-humor-flavor"
