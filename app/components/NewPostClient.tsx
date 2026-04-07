@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import { loadSadGirlFlavor } from '../../src/lib/sadGirlFlavor';
 import { supabase } from '../../src/lib/supabase/client';
 
 const PIPELINE_BASE_URL = 'https://api.almostcrackd.ai';
@@ -13,6 +14,11 @@ const SUPPORTED_IMAGE_TYPES = new Set([
     'image/heic',
 ]);
 const FILE_INPUT_ACCEPT = Array.from(SUPPORTED_IMAGE_TYPES).join(',');
+
+type PersistedCaption = {
+    id: string | null;
+    content: string;
+};
 
 function parseErrorMessage(data: unknown, fallback: string): string {
     if (!data || typeof data !== 'object') {
@@ -103,96 +109,71 @@ function shouldRetryWithDifferentHumorFlavor(message: string): boolean {
     );
 }
 
-type HumorFlavorOption = {
-    id: number;
-    label: string;
-    slug: string | null;
-};
+function delay(ms: number) {
+    return new Promise((resolve) => {
+        window.setTimeout(resolve, ms);
+    });
+}
 
-async function loadHumorFlavorOptions(): Promise<HumorFlavorOption[]> {
-    const { data, error } = await supabase
-        .from('humor_flavor_steps')
-        .select('humor_flavor_id, order_by')
-        .order('humor_flavor_id', { ascending: true })
-        .order('order_by', { ascending: true })
-        .limit(200);
+async function fetchGeneratedCaptions(
+    imageId: string,
+    humorFlavorId: number
+): Promise<PersistedCaption[]> {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+        const { data, error } = await supabase
+            .from('captions')
+            .select('id, content, created_datetime_utc')
+            .eq('image_id', imageId)
+            .eq('humor_flavor_id', humorFlavorId)
+            .order('created_datetime_utc', { ascending: false })
+            .limit(20);
 
-    if (error) {
-        throw new Error(`Failed to load humor flavor settings: ${error.message}`);
-    }
+        if (error) {
+            throw new Error(`Failed to load generated captions: ${error.message}`);
+        }
 
-    const uniqueIds = Array.from(
-        new Set(
-            (data ?? [])
-                .map((row) => row.humor_flavor_id)
-                .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
-        )
-    );
+        const captions = (data ?? [])
+            .map((row) => ({
+                id: typeof row.id === 'string' ? row.id : null,
+                content: typeof row.content === 'string' ? row.content.trim() : '',
+            }))
+            .filter((row) => row.content.length > 0);
 
-    if (uniqueIds.length === 0) {
-        throw new Error(
-            'No humor flavor steps are configured in Supabase. Add at least one row to public.humor_flavor_steps before generating captions.'
-        );
-    }
+        if (captions.length > 0) {
+            return captions;
+        }
 
-    const { data: captionRows, error: captionsError } = await supabase
-        .from('captions')
-        .select('humor_flavor_id')
-        .in('humor_flavor_id', uniqueIds)
-        .limit(2000);
-
-    if (!captionsError) {
-        const flavorIdsWithCaptions = new Set(
-            (captionRows ?? [])
-                .map((row) => row.humor_flavor_id)
-                .filter(
-                    (value): value is number =>
-                        typeof value === 'number' && Number.isFinite(value)
-                )
-        );
-
-        const filteredIds = uniqueIds.filter((id) => flavorIdsWithCaptions.has(id));
-        if (filteredIds.length > 0) {
-            uniqueIds.splice(0, uniqueIds.length, ...filteredIds);
+        if (attempt < 4) {
+            await delay(700);
         }
     }
 
-    const { data: flavorRows, error: flavorsError } = await supabase
-        .from('humor_flavors')
-        .select('id, slug, description')
-        .in('id', uniqueIds)
-        .order('id', { ascending: true });
+    return [];
+}
 
-    if (flavorsError) {
-        return uniqueIds.map((id) => ({
-            id,
-            label: `Flavor ${id}`,
-            slug: null,
-        }));
+async function fetchVotesForCaptionIds(
+    profileId: string,
+    captionIds: string[]
+): Promise<Record<string, number>> {
+    if (captionIds.length === 0) {
+        return {};
     }
 
-    const flavorsById = new Map(
-        (flavorRows ?? []).map((row) => [
-            row.id,
-            {
-                slug: typeof row.slug === 'string' ? row.slug : null,
-                description:
-                    typeof row.description === 'string' && row.description.trim().length > 0
-                        ? row.description.trim()
-                        : null,
-            },
-        ])
-    );
+    const { data, error } = await supabase
+        .from('caption_votes')
+        .select('caption_id, vote_value')
+        .eq('profile_id', profileId)
+        .in('caption_id', captionIds);
 
-    return uniqueIds.map((id) => {
-        const flavor = flavorsById.get(id);
-        const slug = flavor?.slug ?? null;
-        return {
-            id,
-            slug,
-            label: slug ?? flavor?.description ?? `Flavor ${id}`,
-        };
-    });
+    if (error) {
+        throw new Error(`Failed to load votes: ${error.message}`);
+    }
+
+    const mappedVotes: Record<string, number> = {};
+    for (const row of data ?? []) {
+        mappedVotes[row.caption_id] = row.vote_value;
+    }
+    return mappedVotes;
 }
 
 export function NewPostClient() {
@@ -201,44 +182,62 @@ export function NewPostClient() {
     const [statusMessage, setStatusMessage] = useState<string | null>(null);
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
     const [imageUrl, setImageUrl] = useState<string | null>(null);
-    const [captions, setCaptions] = useState<string[]>([]);
+    const [captions, setCaptions] = useState<PersistedCaption[]>([]);
     const [captionIndex, setCaptionIndex] = useState(0);
-    const [humorFlavorOptions, setHumorFlavorOptions] = useState<HumorFlavorOption[]>([]);
-    const [selectedHumorFlavorId, setSelectedHumorFlavorId] = useState<number | null>(null);
+    const [sadGirlFlavorId, setSadGirlFlavorId] = useState<number | null>(null);
+    const [sadGirlFlavorDescription, setSadGirlFlavorDescription] = useState<string | null>(null);
     const [humorFlavorError, setHumorFlavorError] = useState<string | null>(null);
     const [humorFlavorLoading, setHumorFlavorLoading] = useState(true);
+    const [userId, setUserId] = useState<string | null>(null);
+    const [authChecked, setAuthChecked] = useState(false);
+    const [voteSaving, setVoteSaving] = useState(false);
+    const [voteError, setVoteError] = useState<string | null>(null);
+    const [votesByCaption, setVotesByCaption] = useState<Record<string, number>>({});
 
     const currentCaption = captions[captionIndex] ?? null;
     const isFirstCaption = captionIndex <= 0;
     const isLastCaption = captionIndex >= captions.length - 1;
     const fileLabel = useMemo(() => selectedFile?.name ?? 'No file selected', [selectedFile]);
+    const canVote = authChecked && !!userId;
+    const selectedVote =
+        currentCaption?.id ? votesByCaption[currentCaption.id] ?? null : null;
 
     useEffect(() => {
         let isMounted = true;
 
-        const loadOptions = async () => {
+        const bootstrap = async () => {
             setHumorFlavorLoading(true);
             setHumorFlavorError(null);
 
             try {
-                const options = await loadHumorFlavorOptions();
+                const [{ data: userData, error: userError }, flavor] = await Promise.all([
+                    supabase.auth.getUser(),
+                    loadSadGirlFlavor(),
+                ]);
+
                 if (!isMounted) {
                     return;
                 }
 
-                setHumorFlavorOptions(options);
-                const defaultOption =
-                    options.find((option) => option.slug === 'col-um-bia') ?? options[0] ?? null;
-                setSelectedHumorFlavorId(defaultOption?.id ?? null);
+                if (userError) {
+                    setUserId(null);
+                } else {
+                    setUserId(userData.user?.id ?? null);
+                }
+
+                setAuthChecked(true);
+                setSadGirlFlavorId(flavor.id);
+                setSadGirlFlavorDescription(flavor.description);
             } catch (error) {
                 if (!isMounted) {
                     return;
                 }
 
-                setHumorFlavorOptions([]);
-                setSelectedHumorFlavorId(null);
+                setSadGirlFlavorId(null);
+                setSadGirlFlavorDescription(null);
+                setAuthChecked(true);
                 setHumorFlavorError(
-                    error instanceof Error ? error.message : 'Failed to load humor flavors.'
+                    error instanceof Error ? error.message : 'Failed to load sad-girl.'
                 );
             } finally {
                 if (isMounted) {
@@ -247,7 +246,7 @@ export function NewPostClient() {
             }
         };
 
-        loadOptions();
+        bootstrap();
 
         return () => {
             isMounted = false;
@@ -276,6 +275,8 @@ export function NewPostClient() {
         setCaptions([]);
         setCaptionIndex(0);
         setImageUrl(null);
+        setVotesByCaption({});
+        setVoteError(null);
 
         if (!file) {
             setSelectedFile(null);
@@ -293,22 +294,103 @@ export function NewPostClient() {
         setSelectedFile(file);
     };
 
+    const voteOnCaption = async (captionId: string, voteValue: 1 | -1) => {
+        setVoteError(null);
+        setVoteSaving(true);
+
+        try {
+            const {
+                data: { user },
+                error: userError,
+            } = await supabase.auth.getUser();
+
+            if (userError) {
+                throw userError;
+            }
+
+            if (!user) {
+                throw new Error('Not signed in');
+            }
+
+            setUserId(user.id);
+            setAuthChecked(true);
+
+            const { data: existing, error: selectError } = await supabase
+                .from('caption_votes')
+                .select('id')
+                .eq('profile_id', user.id)
+                .eq('caption_id', captionId)
+                .maybeSingle();
+
+            if (selectError) {
+                throw selectError;
+            }
+
+            if (existing?.id) {
+                const { error: updateError } = await supabase
+                    .from('caption_votes')
+                    .update({
+                        vote_value: voteValue,
+                        modified_by_user_id: user.id,
+                    })
+                    .eq('id', existing.id);
+
+                if (updateError) {
+                    throw updateError;
+                }
+            } else {
+                const { error: insertError } = await supabase
+                    .from('caption_votes')
+                    .insert({
+                        profile_id: user.id,
+                        caption_id: captionId,
+                        vote_value: voteValue,
+                        created_by_user_id: user.id,
+                        modified_by_user_id: user.id,
+                    });
+
+                if (insertError) {
+                    throw insertError;
+                }
+            }
+
+            setVotesByCaption((prev) => ({
+                ...prev,
+                [captionId]: voteValue,
+            }));
+        } catch (error) {
+            const message =
+                error instanceof Error ? error.message : 'Failed to save vote.';
+            if (message === 'Not signed in') {
+                setUserId(null);
+                setAuthChecked(true);
+                setVoteError('Sign in to vote on generated captions.');
+            } else {
+                setVoteError(message);
+            }
+        } finally {
+            setVoteSaving(false);
+        }
+    };
+
     const generateCaptions = async () => {
         if (!selectedFile) {
             setErrorMessage('Choose an image first.');
             return;
         }
-        if (!selectedHumorFlavorId) {
-            setErrorMessage('Choose a humor flavor first.');
+        if (!sadGirlFlavorId) {
+            setErrorMessage('sad-girl is not configured in Supabase yet.');
             return;
         }
 
         setUploading(true);
         setErrorMessage(null);
+        setVoteError(null);
         setStatusMessage('Generating presigned upload URL...');
         setCaptions([]);
         setCaptionIndex(0);
         setImageUrl(null);
+        setVotesByCaption({});
 
         try {
             const {
@@ -384,30 +466,49 @@ export function NewPostClient() {
                 );
             }
 
-            setStatusMessage('Generating captions...');
+            setStatusMessage('Generating sad-girl captions...');
             const { response: generateResponse, data: generatedData } =
-                await generateCaptionsForFlavor(
-                    authHeaders,
-                    registerData.imageId,
-                    selectedHumorFlavorId
-                );
+                await generateCaptionsForFlavor(authHeaders, registerData.imageId, sadGirlFlavorId);
 
             if (!generateResponse.ok) {
                 const message = parseErrorMessage(generatedData, 'Failed to generate captions.');
                 if (shouldRetryWithDifferentHumorFlavor(message)) {
                     throw new Error(
-                        `Humor flavor ${selectedHumorFlavorId} exists in app configuration, but the pipeline has no steps for it. Verify rows in public.humor_flavor_steps for humor_flavor_id ${selectedHumorFlavorId}.`
+                        `sad-girl exists in public.humor_flavors, but the pipeline has no steps for humor_flavor_id ${sadGirlFlavorId}.`
                     );
                 }
                 throw new Error(message);
             }
 
-            const nextCaptions = parseCaptionList(generatedData);
+            const persistedCaptions = await fetchGeneratedCaptions(
+                registerData.imageId,
+                sadGirlFlavorId
+            );
+            const fallbackCaptions = parseCaptionList(generatedData).map((content) => ({
+                id: null,
+                content,
+            }));
+            const nextCaptions =
+                persistedCaptions.length > 0 ? persistedCaptions : fallbackCaptions;
+
             setCaptions(nextCaptions);
             setCaptionIndex(0);
+
+            if (userId) {
+                const captionIds = nextCaptions
+                    .map((caption) => caption.id)
+                    .filter((captionId): captionId is string => Boolean(captionId));
+                if (captionIds.length > 0) {
+                    const existingVotes = await fetchVotesForCaptionIds(userId, captionIds);
+                    setVotesByCaption(existingVotes);
+                }
+            }
+
             setStatusMessage(
                 nextCaptions.length > 0
-                    ? 'Captions generated.'
+                    ? persistedCaptions.length > 0
+                        ? 'sad-girl captions generated and ready for voting.'
+                        : 'Captions generated, but the saved caption rows were not available yet.'
                     : 'No captions were returned for this image.'
             );
         } catch (error) {
@@ -428,59 +529,6 @@ export function NewPostClient() {
             <div aria-hidden="true" className="ambient-blob ambient-blob-secondary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-tertiary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-bottom" />
-            <div className="fixed right-8 top-20 z-20">
-                <div className="linear-glass hidden min-w-[220px] rounded-2xl p-3 lg:block">
-                    <label
-                        htmlFor="humor-flavor"
-                        className="font-mono text-[10px] uppercase tracking-[0.18em] text-[#8A8F98]"
-                    >
-                        Humor Flavor
-                    </label>
-                    <div className="relative mt-2">
-                        <select
-                            id="humor-flavor"
-                            value={selectedHumorFlavorId ?? ''}
-                            onChange={(event) =>
-                                setSelectedHumorFlavorId(Number(event.target.value) || null)
-                            }
-                            disabled={
-                                uploading ||
-                                humorFlavorLoading ||
-                                humorFlavorOptions.length === 0
-                            }
-                            className="w-full appearance-none rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 pr-10 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition duration-200 ease-out focus:border-[#5E6AD2]/50 focus:outline-none focus:ring-2 focus:ring-[#5E6AD2]/40 disabled:cursor-not-allowed disabled:opacity-60"
-                        >
-                            {humorFlavorOptions.length === 0 ? (
-                                <option value="">
-                                    {humorFlavorLoading
-                                        ? 'Loading flavors...'
-                                        : 'No flavors available'}
-                                </option>
-                            ) : (
-                                humorFlavorOptions.map((option) => (
-                                    <option
-                                        key={option.id}
-                                        value={option.id}
-                                        className="bg-[#111214] text-[#EDEDEF]"
-                                    >
-                                        {option.label}
-                                    </option>
-                                ))
-                            )}
-                        </select>
-                        <svg
-                            aria-hidden="true"
-                            viewBox="0 0 20 20"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.8"
-                            className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#8A8F98]"
-                        >
-                            <path d="M5 7.5 10 12.5 15 7.5" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
-                    </div>
-                </div>
-            </div>
 
             <div className="relative z-10 mx-auto flex w-full max-w-3xl flex-col gap-8">
                 <header className="space-y-3 pt-8 sm:pt-12">
@@ -488,67 +536,28 @@ export function NewPostClient() {
                         New Post
                     </p>
                     <h1 className="bg-gradient-to-b from-white via-white/95 to-white/65 bg-clip-text font-[var(--font-playfair)] text-4xl font-semibold leading-tight tracking-tight text-transparent sm:text-5xl">
-                        Upload an image and generate captions
+                        Upload an image and generate sad-girl captions
                     </h1>
                 </header>
 
                 <section className="linear-glass space-y-4 rounded-2xl p-4 sm:p-6">
-                    <div className="space-y-2 lg:hidden">
-                        <label
-                            htmlFor="humor-flavor"
-                            className="font-mono text-[11px] uppercase tracking-[0.2em] text-[#8A8F98]"
-                        >
+                    <div className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3">
+                        <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-[#8A8F98]">
                             Humor Flavor
-                        </label>
-                        <div className="relative">
-                            <select
-                                id="humor-flavor"
-                                value={selectedHumorFlavorId ?? ''}
-                                onChange={(event) =>
-                                    setSelectedHumorFlavorId(Number(event.target.value) || null)
-                                }
-                                disabled={
-                                    uploading ||
-                                    humorFlavorLoading ||
-                                    humorFlavorOptions.length === 0
-                                }
-                                className="w-full appearance-none rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 pr-10 text-base font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition duration-200 ease-out focus:border-[#5E6AD2]/50 focus:outline-none focus:ring-2 focus:ring-[#5E6AD2]/40 disabled:cursor-not-allowed disabled:opacity-60"
-                            >
-                                {humorFlavorOptions.length === 0 ? (
-                                    <option value="">
-                                        {humorFlavorLoading
-                                            ? 'Loading flavors...'
-                                            : 'No flavors available'}
-                                    </option>
-                                ) : (
-                                    humorFlavorOptions.map((option) => (
-                                        <option
-                                            key={option.id}
-                                            value={option.id}
-                                            className="bg-[#111214] text-[#EDEDEF]"
-                                        >
-                                            {option.label}
-                                        </option>
-                                    ))
-                                )}
-                            </select>
-                            <svg
-                                aria-hidden="true"
-                                viewBox="0 0 20 20"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="1.8"
-                                className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#8A8F98]"
-                            >
-                                <path d="M5 7.5 10 12.5 15 7.5" strokeLinecap="round" strokeLinejoin="round" />
-                            </svg>
-                        </div>
-                        {humorFlavorError && (
-                            <p className="rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
-                                {humorFlavorError}
+                        </p>
+                        <p className="mt-2 text-base font-semibold text-[#EDEDEF]">sad-girl</p>
+                        {sadGirlFlavorDescription && (
+                            <p className="mt-1 text-sm leading-6 text-[#B8BDC8]">
+                                {sadGirlFlavorDescription}
                             </p>
                         )}
                     </div>
+
+                    {humorFlavorError && (
+                        <p className="rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+                            {humorFlavorError}
+                        </p>
+                    )}
 
                     <input
                         type="file"
@@ -562,12 +571,7 @@ export function NewPostClient() {
                     <button
                         type="button"
                         onClick={generateCaptions}
-                        disabled={
-                            !selectedFile ||
-                            uploading ||
-                            humorFlavorLoading ||
-                            !selectedHumorFlavorId
-                        }
+                        disabled={!selectedFile || uploading || humorFlavorLoading || !sadGirlFlavorId}
                         className="rounded-lg border border-[#5E6AD2]/50 bg-[#5E6AD2] px-4 py-2 text-sm font-semibold text-white shadow-[0_0_0_1px_rgba(94,106,210,0.5),0_4px_12px_rgba(94,106,210,0.3),inset_0_1px_0_rgba(255,255,255,0.2)] transition duration-200 ease-out hover:bg-[#6872D9] disabled:cursor-not-allowed disabled:opacity-60"
                     >
                         {uploading ? 'Processing...' : 'Generate Captions'}
@@ -600,32 +604,127 @@ export function NewPostClient() {
                                     Caption {captionIndex + 1} of {captions.length}
                                 </p>
                                 <p className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-lg text-[#EDEDEF]">
-                                    {currentCaption}
+                                    {currentCaption.content}
                                 </p>
-                                <div className="flex w-full items-center">
-                                    <button
-                                        type="button"
-                                        onClick={() =>
-                                            setCaptionIndex((prev) => (prev > 0 ? prev - 1 : 0))
-                                        }
-                                        disabled={isFirstCaption}
-                                        className="mr-auto rounded-lg border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-60"
-                                    >
-                                        Back
-                                    </button>
-                                    <button
-                                        type="button"
-                                        onClick={() =>
-                                            setCaptionIndex((prev) =>
-                                                prev < captions.length - 1 ? prev + 1 : prev
-                                            )
-                                        }
-                                        disabled={isLastCaption}
-                                        className="ml-auto rounded-lg border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-60"
-                                    >
-                                        Next
-                                    </button>
+
+                                {!canVote && (
+                                    <p className="text-sm text-[#8A8F98]">
+                                        Sign in to vote.{' '}
+                                        <a
+                                            href="/login"
+                                            className="font-semibold text-[#EDEDEF] underline decoration-[#5E6AD2]/70 underline-offset-2"
+                                        >
+                                            Go to login
+                                        </a>
+                                    </p>
+                                )}
+
+                                {!currentCaption.id && (
+                                    <p className="text-sm text-[#8A8F98]">
+                                        Voting unlocks once the generated caption row is available in
+                                        Supabase.
+                                    </p>
+                                )}
+
+                                <div className="space-y-3 pt-1">
+                                    <div className="flex w-full items-center justify-center gap-8">
+                                        <button
+                                            type="button"
+                                            onClick={() =>
+                                                currentCaption.id &&
+                                                voteOnCaption(currentCaption.id, 1)
+                                            }
+                                            aria-label="Upvote"
+                                            className={`inline-flex h-24 w-72 max-w-[45%] flex-col items-center justify-center gap-2 rounded-xl border px-4 text-5xl leading-none transition duration-200 ease-out disabled:cursor-not-allowed disabled:opacity-60 ${
+                                                selectedVote === 1
+                                                    ? 'border border-[#5E6AD2]/50 bg-[#5E6AD2] text-white shadow-[0_0_0_1px_rgba(94,106,210,0.5),0_4px_12px_rgba(94,106,210,0.3),inset_0_1px_0_rgba(255,255,255,0.2)]'
+                                                    : 'border border-white/10 bg-white/[0.04] text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] hover:border-white/20 hover:bg-white/[0.08]'
+                                            }`}
+                                            disabled={!canVote || voteSaving || !currentCaption.id}
+                                        >
+                                            <svg
+                                                aria-hidden="true"
+                                                viewBox="0 0 24 24"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                strokeWidth="1.9"
+                                                strokeLinecap="round"
+                                                strokeLinejoin="round"
+                                                className="h-10 w-10"
+                                            >
+                                                <path d="M7 10v10" />
+                                                <path d="M11 20h7.2a2 2 0 0 0 2-1.6l1-5a2 2 0 0 0-2-2.4h-4.1l.7-3.2a2 2 0 0 0-2-2.4H12l-3 4.6V20" />
+                                                <path d="M3 10h4v10H3z" />
+                                            </svg>
+                                            <span className="text-sm font-semibold tracking-wide">
+                                                Funny
+                                            </span>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() =>
+                                                currentCaption.id &&
+                                                voteOnCaption(currentCaption.id, -1)
+                                            }
+                                            aria-label="Downvote"
+                                            className={`inline-flex h-24 w-72 max-w-[45%] flex-col items-center justify-center gap-2 rounded-xl border px-4 text-5xl leading-none transition duration-200 ease-out disabled:cursor-not-allowed disabled:opacity-60 ${
+                                                selectedVote === -1
+                                                    ? 'border border-white/20 bg-white/[0.14] text-white shadow-[0_0_0_1px_rgba(255,255,255,0.12),0_4px_14px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.2)]'
+                                                    : 'border border-white/10 bg-white/[0.04] text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] hover:border-white/20 hover:bg-white/[0.08]'
+                                            }`}
+                                            disabled={!canVote || voteSaving || !currentCaption.id}
+                                        >
+                                            <svg
+                                                aria-hidden="true"
+                                                viewBox="0 0 24 24"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                strokeWidth="1.9"
+                                                strokeLinecap="round"
+                                                strokeLinejoin="round"
+                                                className="h-10 w-10"
+                                            >
+                                                <path d="M17 14V4" />
+                                                <path d="M13 4H5.8a2 2 0 0 0-2 1.6l-1 5A2 2 0 0 0 4.8 13h4.1l-.7 3.2a2 2 0 0 0 2 2.4H12l3-4.6V4" />
+                                                <path d="M21 4h-4v10h4z" />
+                                            </svg>
+                                            <span className="text-sm font-semibold tracking-wide">
+                                                Not funny
+                                            </span>
+                                        </button>
+                                    </div>
+
+                                    <div className="flex w-full items-center">
+                                        <button
+                                            type="button"
+                                            onClick={() =>
+                                                setCaptionIndex((prev) => (prev > 0 ? prev - 1 : 0))
+                                            }
+                                            disabled={isFirstCaption || voteSaving}
+                                            className="mr-auto rounded-lg border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                            Back
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() =>
+                                                setCaptionIndex((prev) =>
+                                                    prev < captions.length - 1 ? prev + 1 : prev
+                                                )
+                                            }
+                                            disabled={isLastCaption || voteSaving}
+                                            className="ml-auto rounded-lg border border-white/10 bg-white/[0.04] px-4 py-2 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] transition duration-200 ease-out hover:border-white/20 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                            Next
+                                        </button>
+                                    </div>
                                 </div>
+
+                                {voteError && (
+                                    <p className="rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+                                        {voteError}
+                                    </p>
+                                )}
                             </>
                         )}
                     </section>

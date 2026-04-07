@@ -2,18 +2,24 @@
 
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { loadSadGirlFlavor } from '../../src/lib/sadGirlFlavor';
 import { supabase } from '../../src/lib/supabase/client';
 
-type Image = {
+type CaptionRow = {
     id: string;
-    url: string | null;
+    content: string | null;
     created_datetime_utc: string;
-    captions: {
-        id: string;
-        content: string | null;
-        created_datetime_utc: string;
-        humor_flavor_id?: number | null;
-    }[];
+    image_id: string;
+    images:
+        | {
+              id: string;
+              url: string | null;
+          }
+        | {
+              id: string;
+              url: string | null;
+          }[]
+        | null;
 };
 
 type CaptionSessionItem = {
@@ -32,12 +38,6 @@ const UPLOAD_PROMPT_STORAGE_KEY = 'seen-upload-prompt';
 const UPLOAD_PROMPT_VOTE_COUNT_KEY = 'upload-prompt-vote-count';
 const UPLOAD_PROMPT_THRESHOLD = 3;
 
-type HumorFlavorOption = {
-    id: number;
-    label: string;
-    slug: string | null;
-};
-
 function shuffleItems<T>(items: T[]): T[] {
     const shuffled = [...items];
     for (let i = shuffled.length - 1; i > 0; i -= 1) {
@@ -55,93 +55,6 @@ function hasDisplayableCaption(
     return Boolean(imageUrl && captionContent);
 }
 
-async function loadHumorFlavorOptions(): Promise<HumorFlavorOption[]> {
-    const { data, error } = await supabase
-        .from('humor_flavor_steps')
-        .select('humor_flavor_id, order_by')
-        .order('humor_flavor_id', { ascending: true })
-        .order('order_by', { ascending: true })
-        .limit(200);
-
-    if (error) {
-        throw new Error(`Failed to load humor flavor settings: ${error.message}`);
-    }
-
-    const uniqueIds = Array.from(
-        new Set(
-            (data ?? [])
-                .map((row) => row.humor_flavor_id)
-                .filter(
-                    (value): value is number =>
-                        typeof value === 'number' && Number.isFinite(value)
-                )
-        )
-    );
-
-    if (uniqueIds.length === 0) {
-        throw new Error('No humor flavors are configured yet.');
-    }
-
-    const { data: captionRows, error: captionsError } = await supabase
-        .from('captions')
-        .select('humor_flavor_id')
-        .in('humor_flavor_id', uniqueIds)
-        .limit(2000);
-
-    if (!captionsError) {
-        const flavorIdsWithCaptions = new Set(
-            (captionRows ?? [])
-                .map((row) => row.humor_flavor_id)
-                .filter(
-                    (value): value is number =>
-                        typeof value === 'number' && Number.isFinite(value)
-                )
-        );
-
-        const filteredIds = uniqueIds.filter((id) => flavorIdsWithCaptions.has(id));
-        if (filteredIds.length > 0) {
-            uniqueIds.splice(0, uniqueIds.length, ...filteredIds);
-        }
-    }
-
-    const { data: flavorRows, error: flavorsError } = await supabase
-        .from('humor_flavors')
-        .select('id, slug, description')
-        .in('id', uniqueIds)
-        .order('id', { ascending: true });
-
-    if (flavorsError) {
-        return uniqueIds.map((id) => ({
-            id,
-            label: `Flavor ${id}`,
-            slug: null,
-        }));
-    }
-
-    const flavorsById = new Map(
-        (flavorRows ?? []).map((row) => [
-            row.id,
-            {
-                slug: typeof row.slug === 'string' ? row.slug : null,
-                description:
-                    typeof row.description === 'string' && row.description.trim().length > 0
-                        ? row.description.trim()
-                        : null,
-            },
-        ])
-    );
-
-    return uniqueIds.map((id) => {
-        const flavor = flavorsById.get(id);
-        const slug = flavor?.slug ?? null;
-        return {
-            id,
-            slug,
-            label: slug ?? flavor?.description ?? `Flavor ${id}`,
-        };
-    });
-}
-
 export function GalleryClient() {
     const seenCaptionIdsRef = useRef<Set<string>>(new Set());
     const seenImageIdsRef = useRef<Set<string>>(new Set());
@@ -157,8 +70,8 @@ export function GalleryClient() {
     const [voteError, setVoteError] = useState<string | null>(null);
     const [votesByCaption, setVotesByCaption] = useState<Record<string, number>>({});
     const [spotlight, setSpotlight] = useState({ x: 50, y: 50, active: false });
-    const [humorFlavorOptions, setHumorFlavorOptions] = useState<HumorFlavorOption[]>([]);
-    const [selectedHumorFlavorId, setSelectedHumorFlavorId] = useState<number | null>(null);
+    const [sadGirlFlavorId, setSadGirlFlavorId] = useState<number | null>(null);
+    const [sadGirlFlavorDescription, setSadGirlFlavorDescription] = useState<string | null>(null);
     const [humorFlavorLoading, setHumorFlavorLoading] = useState(true);
     const [humorFlavorError, setHumorFlavorError] = useState<string | null>(null);
     const [showUploadPrompt, setShowUploadPrompt] = useState(false);
@@ -189,24 +102,22 @@ export function GalleryClient() {
             setHumorFlavorError(null);
 
             try {
-                const options = await loadHumorFlavorOptions();
+                const flavor = await loadSadGirlFlavor();
                 if (!isMounted) {
                     return;
                 }
 
-                setHumorFlavorOptions(options);
-                const defaultOption =
-                    options.find((option) => option.slug === 'col-um-bia') ?? options[0] ?? null;
-                setSelectedHumorFlavorId(defaultOption?.id ?? null);
+                setSadGirlFlavorId(flavor.id);
+                setSadGirlFlavorDescription(flavor.description);
             } catch (error) {
                 if (!isMounted) {
                     return;
                 }
 
-                setHumorFlavorOptions([]);
-                setSelectedHumorFlavorId(null);
+                setSadGirlFlavorId(null);
+                setSadGirlFlavorDescription(null);
                 setHumorFlavorError(
-                    error instanceof Error ? error.message : 'Failed to load humor flavors.'
+                    error instanceof Error ? error.message : 'Failed to load sad-girl.'
                 );
             } finally {
                 if (isMounted) {
@@ -223,12 +134,12 @@ export function GalleryClient() {
     }, []);
 
     useEffect(() => {
-        if (!userId || !selectedHumorFlavorId) {
+        if (!userId || !sadGirlFlavorId) {
             viewedImageIdsRef.current = new Set();
             return;
         }
 
-        const storageKey = `${VIEWED_IMAGES_STORAGE_PREFIX}:${userId}:${selectedHumorFlavorId}`;
+        const storageKey = `${VIEWED_IMAGES_STORAGE_PREFIX}:${userId}:${sadGirlFlavorId}`;
         try {
             const saved = window.localStorage.getItem(storageKey);
             if (!saved) {
@@ -248,10 +159,10 @@ export function GalleryClient() {
         } catch {
             viewedImageIdsRef.current = new Set();
         }
-    }, [selectedHumorFlavorId, userId]);
+    }, [sadGirlFlavorId, userId]);
 
     useEffect(() => {
-        if (!userId || !selectedHumorFlavorId || !currentItem?.imageId) {
+        if (!userId || !sadGirlFlavorId || !currentItem?.imageId) {
             return;
         }
 
@@ -260,7 +171,7 @@ export function GalleryClient() {
         }
 
         viewedImageIdsRef.current.add(currentItem.imageId);
-        const storageKey = `${VIEWED_IMAGES_STORAGE_PREFIX}:${userId}:${selectedHumorFlavorId}`;
+        const storageKey = `${VIEWED_IMAGES_STORAGE_PREFIX}:${userId}:${sadGirlFlavorId}`;
 
         try {
             window.localStorage.setItem(
@@ -270,7 +181,7 @@ export function GalleryClient() {
         } catch {
             // Ignore localStorage write failures and keep in-memory history.
         }
-    }, [currentItem, selectedHumorFlavorId, userId]);
+    }, [currentItem, sadGirlFlavorId, userId]);
 
     const dismissUploadPrompt = () => {
         setShowUploadPrompt(false);
@@ -285,7 +196,7 @@ export function GalleryClient() {
         let isMounted = true;
         let activeUserId: string | null = null;
 
-        if (!selectedHumorFlavorId) {
+        if (!sadGirlFlavorId) {
             setCaptionItems([]);
             setLoading(humorFlavorLoading);
             return () => {
@@ -347,10 +258,11 @@ export function GalleryClient() {
         ) => {
             const oneWeekAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
             const { data, error: queryError } = await supabase
-                .from('images')
+                .from('captions')
                 .select(
-                    'id, url, created_datetime_utc, captions ( id, content, created_datetime_utc, humor_flavor_id )'
+                    'id, content, created_datetime_utc, image_id, images ( id, url )'
                 )
+                .eq('humor_flavor_id', sadGirlFlavorId)
                 .order('created_datetime_utc', { ascending: false });
 
             if (!isMounted) {
@@ -365,42 +277,31 @@ export function GalleryClient() {
                 return;
             }
 
-            const rows = (data ?? []) as Image[];
-            const normalized = rows.map((image) => ({
-                ...image,
-                captions: Array.isArray(image.captions)
-                    ? [...image.captions]
-                          .filter(
-                              (caption) =>
-                                  caption.humor_flavor_id === selectedHumorFlavorId
-                          )
-                          .sort(
-                          (a, b) =>
-                              Date.parse(b.created_datetime_utc) -
-                              Date.parse(a.created_datetime_utc)
-                      )
-                    : [],
-            }));
+            const rows = (data ?? []) as CaptionRow[];
+            const latestByImage = new Map<string, CaptionSessionItem>();
 
-            const filtered = normalized.filter((image) => image.captions.length > 0);
-            const sortedImages = filtered.sort((a, b) => {
-                const aLatest =
-                    a.captions.length > 0
-                        ? Date.parse(a.captions[0].created_datetime_utc)
-                        : 0;
-                const bLatest =
-                    b.captions.length > 0
-                        ? Date.parse(b.captions[0].created_datetime_utc)
-                        : 0;
-                return bLatest - aLatest;
-            });
+            for (const row of rows) {
+                const image = Array.isArray(row.images) ? row.images[0] ?? null : row.images;
+                if (!image?.id) {
+                    continue;
+                }
 
-            const latestCaptionPerImage = sortedImages
-                .map((image) => ({
-                    imageId: image.id,
+                if (latestByImage.has(row.image_id)) {
+                    continue;
+                }
+
+                latestByImage.set(row.image_id, {
+                    imageId: row.image_id,
                     imageUrl: image.url,
-                    caption: image.captions[0],
-                }))
+                    caption: {
+                        id: row.id,
+                        content: row.content,
+                        created_datetime_utc: row.created_datetime_utc,
+                    },
+                });
+            }
+
+            const latestCaptionPerImage = Array.from(latestByImage.values())
                 .filter(hasDisplayableCaption)
                 .filter((item) => {
                     const captionCreatedMs = Date.parse(item.caption.created_datetime_utc);
@@ -506,7 +407,7 @@ export function GalleryClient() {
             window.clearInterval(pollId);
             supabase.removeChannel(channel);
         };
-    }, [humorFlavorLoading, selectedHumorFlavorId]);
+    }, [humorFlavorLoading, sadGirlFlavorId]);
 
     const goToNextCaption = () => {
         setVoteError(null);
@@ -627,55 +528,6 @@ export function GalleryClient() {
             <div aria-hidden="true" className="ambient-blob ambient-blob-secondary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-tertiary" />
             <div aria-hidden="true" className="ambient-blob ambient-blob-bottom" />
-            <div className="fixed right-8 top-20 z-20">
-                <div className="linear-glass hidden min-w-[220px] rounded-2xl p-3 lg:block">
-                    <label
-                        htmlFor="vote-humor-flavor"
-                        className="font-mono text-[10px] uppercase tracking-[0.18em] text-[#8A8F98]"
-                    >
-                        Humor Flavor
-                    </label>
-                    <div className="relative mt-2">
-                        <select
-                            id="vote-humor-flavor"
-                            value={selectedHumorFlavorId ?? ''}
-                            onChange={(event) =>
-                                setSelectedHumorFlavorId(Number(event.target.value) || null)
-                            }
-                            disabled={humorFlavorLoading || humorFlavorOptions.length === 0}
-                            className="w-full appearance-none rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 pr-10 text-sm font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition duration-200 ease-out focus:border-[#5E6AD2]/50 focus:outline-none focus:ring-2 focus:ring-[#5E6AD2]/40 disabled:cursor-not-allowed disabled:opacity-60"
-                        >
-                            {humorFlavorOptions.length === 0 ? (
-                                <option value="">
-                                    {humorFlavorLoading
-                                        ? 'Loading flavors...'
-                                        : 'No flavors available'}
-                                </option>
-                            ) : (
-                                humorFlavorOptions.map((option) => (
-                                    <option
-                                        key={option.id}
-                                        value={option.id}
-                                        className="bg-[#111214] text-[#EDEDEF]"
-                                    >
-                                        {option.label}
-                                    </option>
-                                ))
-                            )}
-                        </select>
-                        <svg
-                            aria-hidden="true"
-                            viewBox="0 0 20 20"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.8"
-                            className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#8A8F98]"
-                        >
-                            <path d="M5 7.5 10 12.5 15 7.5" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
-                    </div>
-                </div>
-            </div>
             <div className="relative z-10 mx-auto flex w-full max-w-3xl flex-col gap-8">
                 {showUploadPrompt && (
                     <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/55 px-4">
@@ -688,7 +540,7 @@ export function GalleryClient() {
                             </h2>
                             <p className="mt-3 text-sm leading-6 text-[#B8BDC8]">
                                 You can keep voting, or open New Post to upload an image and
-                                generate captions in your chosen humor flavor.
+                                generate more captions in your sad-girl humor flavor.
                             </p>
                             <div className="mt-6 flex items-center gap-3">
                                 <Link
@@ -718,51 +570,17 @@ export function GalleryClient() {
                     </h1>
                 </header>
 
-                <section className="linear-glass space-y-3 rounded-2xl p-4 sm:p-6 lg:hidden">
-                    <label
-                        htmlFor="vote-humor-flavor"
-                        className="font-mono text-[11px] uppercase tracking-[0.2em] text-[#8A8F98]"
-                    >
+                <section className="linear-glass space-y-3 rounded-2xl p-4 sm:p-6">
+                    <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-[#8A8F98]">
                         Humor Flavor
-                    </label>
-                    <div className="relative">
-                        <select
-                            id="vote-humor-flavor"
-                            value={selectedHumorFlavorId ?? ''}
-                            onChange={(event) =>
-                                setSelectedHumorFlavorId(Number(event.target.value) || null)
-                            }
-                            disabled={humorFlavorLoading || humorFlavorOptions.length === 0}
-                            className="w-full appearance-none rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 pr-10 text-base font-semibold text-[#EDEDEF] shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition duration-200 ease-out focus:border-[#5E6AD2]/50 focus:outline-none focus:ring-2 focus:ring-[#5E6AD2]/40 disabled:cursor-not-allowed disabled:opacity-60"
-                        >
-                            {humorFlavorOptions.length === 0 ? (
-                                <option value="">
-                                    {humorFlavorLoading
-                                        ? 'Loading flavors...'
-                                        : 'No flavors available'}
-                                </option>
-                            ) : (
-                                humorFlavorOptions.map((option) => (
-                                    <option
-                                        key={option.id}
-                                        value={option.id}
-                                        className="bg-[#111214] text-[#EDEDEF]"
-                                    >
-                                        {option.label}
-                                    </option>
-                                ))
-                            )}
-                        </select>
-                        <svg
-                            aria-hidden="true"
-                            viewBox="0 0 20 20"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.8"
-                            className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#8A8F98]"
-                        >
-                            <path d="M5 7.5 10 12.5 15 7.5" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
+                    </p>
+                    <div className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3">
+                        <p className="text-base font-semibold text-[#EDEDEF]">sad-girl</p>
+                        {sadGirlFlavorDescription && (
+                            <p className="mt-1 text-sm leading-6 text-[#B8BDC8]">
+                                {sadGirlFlavorDescription}
+                            </p>
+                        )}
                     </div>
                     {humorFlavorError && (
                         <p className="rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
