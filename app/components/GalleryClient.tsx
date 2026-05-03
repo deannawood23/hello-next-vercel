@@ -32,20 +32,15 @@ type CaptionSessionItem = {
     };
 };
 
-const CAPTIONS_PER_SESSION = 10;
+type CaptionQueryResult = {
+    rows: CaptionRow[];
+    totalCount: number;
+};
+
 const VIEWED_IMAGES_STORAGE_PREFIX = 'viewed-image-ids';
 const UPLOAD_PROMPT_STORAGE_KEY = 'seen-upload-prompt';
 const UPLOAD_PROMPT_VOTE_COUNT_KEY = 'upload-prompt-vote-count';
 const UPLOAD_PROMPT_THRESHOLD = 3;
-
-function shuffleItems<T>(items: T[]): T[] {
-    const shuffled = [...items];
-    for (let i = shuffled.length - 1; i > 0; i -= 1) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    return shuffled;
-}
 
 function hasDisplayableCaption(
     item: Pick<CaptionSessionItem, 'imageUrl' | 'caption'>
@@ -55,11 +50,122 @@ function hasDisplayableCaption(
     return Boolean(imageUrl && captionContent);
 }
 
+function getCaptionTimestamp(item: CaptionSessionItem): number {
+    const timestamp = Date.parse(item.caption.created_datetime_utc);
+    return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function interleaveByImage(
+    items: CaptionSessionItem[],
+    viewedImageIds: Set<string>
+): CaptionSessionItem[] {
+    const groupedByImage = new Map<string, CaptionSessionItem[]>();
+
+    for (const item of items) {
+        const existing = groupedByImage.get(item.imageId);
+        if (existing) {
+            existing.push(item);
+        } else {
+            groupedByImage.set(item.imageId, [item]);
+        }
+    }
+
+    const queues = Array.from(groupedByImage.entries())
+        .map(([imageId, imageItems]) => ({
+            imageId,
+            items: [...imageItems],
+            latestTimestamp: getCaptionTimestamp(imageItems[0]),
+        }))
+        .sort((left, right) => {
+            const leftViewed = viewedImageIds.has(left.imageId) ? 1 : 0;
+            const rightViewed = viewedImageIds.has(right.imageId) ? 1 : 0;
+
+            if (leftViewed !== rightViewed) {
+                return leftViewed - rightViewed;
+            }
+
+            return right.latestTimestamp - left.latestTimestamp;
+        });
+
+    const ordered: CaptionSessionItem[] = [];
+    let madeProgress = true;
+
+    while (madeProgress) {
+        madeProgress = false;
+
+        for (const queue of queues) {
+            const nextItem = queue.items.shift();
+            if (!nextItem) {
+                continue;
+            }
+
+            ordered.push(nextItem);
+            madeProgress = true;
+        }
+    }
+
+    return ordered;
+}
+
+function buildCaptionFeedOrder(
+    items: CaptionSessionItem[],
+    votesByCaption: Record<string, number>,
+    viewedImageIds: Set<string>
+): CaptionSessionItem[] {
+    const unvotedItems = items.filter((item) => votesByCaption[item.caption.id] == null);
+    const votedItems = items.filter((item) => votesByCaption[item.caption.id] != null);
+
+    return [
+        ...interleaveByImage(unvotedItems, viewedImageIds),
+        ...interleaveByImage(votedItems, viewedImageIds),
+    ];
+}
+
+async function fetchAllCaptionsForFlavor(humorFlavorId: number): Promise<CaptionQueryResult> {
+    const pageSize = 1000;
+    const rows: CaptionRow[] = [];
+    let totalCount = 0;
+    let from = 0;
+
+    while (true) {
+        const to = from + pageSize - 1;
+        const { data, error, count } = await supabase
+            .from('captions')
+            .select(
+                'id, content, created_datetime_utc, image_id, images ( id, url )',
+                { count: 'exact' }
+            )
+            .eq('humor_flavor_id', humorFlavorId)
+            .order('created_datetime_utc', { ascending: false })
+            .range(from, to);
+
+        if (error) {
+            throw error;
+        }
+
+        const pageRows = (data ?? []) as CaptionRow[];
+        rows.push(...pageRows);
+
+        if (typeof count === 'number') {
+            totalCount = count;
+        }
+
+        if (pageRows.length < pageSize) {
+            break;
+        }
+
+        from += pageSize;
+    }
+
+    return {
+        rows,
+        totalCount: totalCount || rows.length,
+    };
+}
+
 export function GalleryClient() {
-    const seenCaptionIdsRef = useRef<Set<string>>(new Set());
-    const seenImageIdsRef = useRef<Set<string>>(new Set());
     const viewedImageIdsRef = useRef<Set<string>>(new Set());
-    const fetchMoreCaptionsRef = useRef<(() => Promise<void>) | null>(null);
+    const currentCaptionIdRef = useRef<string | null>(null);
     const [captionItems, setCaptionItems] = useState<CaptionSessionItem[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
@@ -75,6 +181,8 @@ export function GalleryClient() {
     const [humorFlavorLoading, setHumorFlavorLoading] = useState(true);
     const [humorFlavorError, setHumorFlavorError] = useState<string | null>(null);
     const [showUploadPrompt, setShowUploadPrompt] = useState(false);
+    const [totalCaptionCount, setTotalCaptionCount] = useState(0);
+    const [totalImageCount, setTotalImageCount] = useState(0);
 
     const currentItem = captionItems[currentIndex] ?? null;
     const nextItem = captionItems[currentIndex + 1] ?? null;
@@ -93,6 +201,10 @@ export function GalleryClient() {
         }
         return nextItem.imageUrl;
     }, [currentItem, nextItem]);
+
+    useEffect(() => {
+        currentCaptionIdRef.current = currentItem?.caption.id ?? null;
+    }, [currentItem]);
 
     useEffect(() => {
         let isMounted = true;
@@ -204,32 +316,21 @@ export function GalleryClient() {
             };
         }
 
-        const fetchVotesForCaptionIds = async (
-            profileId: string,
-            captionIds: string[]
-        ) => {
-            if (captionIds.length === 0) {
-                return;
-            }
-
+        const fetchVotesForProfile = async (profileId: string) => {
             const { data, error: votesError } = await supabase
                 .from('caption_votes')
                 .select('caption_id, vote_value')
-                .eq('profile_id', profileId)
-                .in('caption_id', captionIds);
+                .eq('profile_id', profileId);
 
-            if (!isMounted || votesError) {
-                return;
+            if (votesError) {
+                throw votesError;
             }
 
             const mappedVotes: Record<string, number> = {};
             for (const row of data ?? []) {
                 mappedVotes[row.caption_id] = row.vote_value;
             }
-            setVotesByCaption((prev) => ({
-                ...prev,
-                ...mappedVotes,
-            }));
+            return mappedVotes;
         };
 
         const fetchUser = async () => {
@@ -252,130 +353,113 @@ export function GalleryClient() {
             return id;
         };
 
-        const fetchImages = async (
-            profileId: string | null,
-            reset: boolean
-        ) => {
-            const oneWeekAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
-            const { data, error: queryError } = await supabase
-                .from('captions')
-                .select(
-                    'id, content, created_datetime_utc, image_id, images ( id, url )'
-                )
-                .eq('humor_flavor_id', sadGirlFlavorId)
-                .order('created_datetime_utc', { ascending: false });
+        const fetchImages = async (profileId: string | null) => {
+            let captionQueryResult: CaptionQueryResult;
+            try {
+                captionQueryResult = await fetchAllCaptionsForFlavor(sadGirlFlavorId);
+            } catch (queryError) {
+                if (!isMounted) {
+                    return;
+                }
 
-            if (!isMounted) {
-                return;
-            }
-
-            if (queryError) {
-                setError(queryError.message);
+                setError(
+                    queryError instanceof Error
+                        ? queryError.message
+                        : 'Failed to load captions.'
+                );
                 setCaptionItems([]);
                 setVotesByCaption({});
                 setLoading(false);
                 return;
             }
 
-            const rows = (data ?? []) as CaptionRow[];
-            const latestByImage = new Map<string, CaptionSessionItem>();
-
-            for (const row of rows) {
-                const image = Array.isArray(row.images) ? row.images[0] ?? null : row.images;
-                if (!image?.id) {
-                    continue;
-                }
-
-                if (latestByImage.has(row.image_id)) {
-                    continue;
-                }
-
-                latestByImage.set(row.image_id, {
-                    imageId: row.image_id,
-                    imageUrl: image.url,
-                    caption: {
-                        id: row.id,
-                        content: row.content,
-                        created_datetime_utc: row.created_datetime_utc,
-                    },
-                });
-            }
-
-            const latestCaptionPerImage = Array.from(latestByImage.values())
-                .filter(hasDisplayableCaption)
-                .filter((item) => {
-                    const captionCreatedMs = Date.parse(item.caption.created_datetime_utc);
-                    return (
-                        Number.isFinite(captionCreatedMs) &&
-                        captionCreatedMs >= oneWeekAgoMs
-                    );
-                });
-
-            const unseenImages = shuffleItems(
-                latestCaptionPerImage.filter(
-                    (item) => !viewedImageIdsRef.current.has(item.imageId)
-                )
-            );
-            const seenImages = shuffleItems(
-                latestCaptionPerImage.filter((item) =>
-                    viewedImageIdsRef.current.has(item.imageId)
-                )
-            );
-            const sessionCaptions = [...unseenImages, ...seenImages];
-
-            if (reset) {
-                const initialBatch = sessionCaptions.slice(0, CAPTIONS_PER_SESSION);
-                seenCaptionIdsRef.current = new Set(
-                    initialBatch.map((item) => item.caption.id)
-                );
-                seenImageIdsRef.current = new Set(initialBatch.map((item) => item.imageId));
-                setCaptionItems(initialBatch);
-                setCurrentIndex(0);
-                if (profileId) {
-                    await fetchVotesForCaptionIds(
-                        profileId,
-                        initialBatch.map((item) => item.caption.id)
-                    );
-                } else {
-                    setVotesByCaption({});
-                }
-                setError(null);
-                setLoading(false);
+            if (!isMounted) {
                 return;
             }
 
-            const unseenCaptions = sessionCaptions.filter(
-                (item) =>
-                    !seenCaptionIdsRef.current.has(item.caption.id) &&
-                    !seenImageIdsRef.current.has(item.imageId)
-            );
-            const nextBatch = unseenCaptions.slice(0, CAPTIONS_PER_SESSION);
+            const rows = captionQueryResult.rows;
+            const allCaptions = rows
+                .map((row) => {
+                    const image = Array.isArray(row.images) ? row.images[0] ?? null : row.images;
+                    if (!image?.id) {
+                        return null;
+                    }
 
-            if (nextBatch.length > 0) {
-                for (const item of nextBatch) {
-                    seenCaptionIdsRef.current.add(item.caption.id);
-                    seenImageIdsRef.current.add(item.imageId);
-                }
-                setCaptionItems((prev) => [...prev, ...nextBatch]);
-                if (profileId) {
-                    await fetchVotesForCaptionIds(
-                        profileId,
-                        nextBatch.map((item) => item.caption.id)
+                    return {
+                        imageId: row.image_id,
+                        imageUrl: image.url,
+                        caption: {
+                            id: row.id,
+                            content: row.content,
+                            created_datetime_utc: row.created_datetime_utc,
+                        },
+                    } satisfies CaptionSessionItem;
+                })
+                .filter((item): item is CaptionSessionItem => item !== null)
+                .filter(hasDisplayableCaption);
+
+            setTotalCaptionCount(captionQueryResult.totalCount);
+            setTotalImageCount(new Set(allCaptions.map((item) => item.imageId)).size);
+
+            let nextVotesByCaption: Record<string, number> = {};
+            if (profileId) {
+                try {
+                    const allVotes = await fetchVotesForProfile(profileId);
+                    const validCaptionIds = new Set(allCaptions.map((item) => item.caption.id));
+                    nextVotesByCaption = Object.fromEntries(
+                        Object.entries(allVotes).filter(([captionId]) =>
+                            validCaptionIds.has(captionId)
+                        )
                     );
+                } catch (votesError) {
+                    if (!isMounted) {
+                        return;
+                    }
+
+                    setError(
+                        votesError instanceof Error
+                            ? votesError.message
+                            : 'Failed to load votes.'
+                    );
+                    setCaptionItems([]);
+                    setVotesByCaption({});
+                    setLoading(false);
+                    return;
                 }
             }
 
+            const orderedCaptions = buildCaptionFeedOrder(
+                allCaptions,
+                nextVotesByCaption,
+                viewedImageIdsRef.current
+            );
+
+            setVotesByCaption(nextVotesByCaption);
+            setCaptionItems(orderedCaptions);
+            setCurrentIndex((prev) => {
+                const currentCaptionId = currentCaptionIdRef.current;
+                if (currentCaptionId) {
+                    const preservedIndex = orderedCaptions.findIndex(
+                        (item) => item.caption.id === currentCaptionId
+                    );
+                    if (preservedIndex >= 0) {
+                        return preservedIndex;
+                    }
+                }
+
+                if (orderedCaptions.length === 0) {
+                    return 0;
+                }
+
+                return Math.min(prev, orderedCaptions.length);
+            });
             setError(null);
             setLoading(false);
         };
 
-        fetchMoreCaptionsRef.current = async () => {
-            await fetchImages(activeUserId, false);
-        };
-
         const bootstrap = async () => {
             const profileId = await fetchUser();
-            await fetchImages(profileId, true);
+            await fetchImages(profileId);
         };
 
         bootstrap();
@@ -386,20 +470,20 @@ export function GalleryClient() {
                 'postgres_changes',
                 { event: '*', schema: 'public', table: 'images' },
                 () => {
-                    fetchImages(activeUserId, false);
+                    fetchImages(activeUserId);
                 }
             )
             .on(
                 'postgres_changes',
                 { event: '*', schema: 'public', table: 'captions' },
                 () => {
-                    fetchImages(activeUserId, false);
+                    fetchImages(activeUserId);
                 }
             )
             .subscribe();
 
         const pollId = window.setInterval(() => {
-            fetchImages(activeUserId, false);
+            fetchImages(activeUserId);
         }, 15000);
 
         return () => {
@@ -413,9 +497,6 @@ export function GalleryClient() {
         setVoteError(null);
         const nextIndex = currentIndex < captionItems.length ? currentIndex + 1 : currentIndex;
         setCurrentIndex(nextIndex);
-        if (captionItems.length - nextIndex <= 2) {
-            void fetchMoreCaptionsRef.current?.();
-        }
     };
 
     const goToPreviousCaption = () => {
@@ -563,10 +644,10 @@ export function GalleryClient() {
                 )}
                 <header className="space-y-3 pt-8 sm:pt-12">
                     <p className="font-mono text-[11px] uppercase tracking-[0.24em] text-[#8A8F98]">
-                        See what&apos;s cookin
+                        Vote the full archive
                     </p>
                     <h1 className="bg-gradient-to-b from-white via-white/95 to-white/65 bg-clip-text font-[var(--font-playfair)] text-4xl font-semibold leading-tight tracking-tight text-transparent sm:text-5xl">
-                        Newest Crackd Captions 👩‍🍳
+                        Sad-Girl Captions
                     </h1>
                 </header>
 
@@ -581,6 +662,9 @@ export function GalleryClient() {
                                 {sadGirlFlavorDescription}
                             </p>
                         )}
+                        <p className="mt-2 text-xs font-medium uppercase tracking-[0.16em] text-[#8A8F98]">
+                            {totalCaptionCount} captions across {totalImageCount} images
+                        </p>
                     </div>
                     {humorFlavorError && (
                         <p className="rounded-xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
